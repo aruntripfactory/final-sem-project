@@ -1,6 +1,7 @@
 # ingestion/preprocess.py
 import re
 import logging
+import uuid
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -321,6 +322,21 @@ class ResearchPaperChunker:
                     continue
         return None
     
+    def chunk_document(self, doc_data: Dict[str, Any]) -> List[TextChunk]:
+        """
+        Create structured chunks from a document dictionary.
+        
+        Args:
+            doc_data: Dictionary containing 'content' and potentially 'title', 'paper_id'
+            
+        Returns:
+            List of TextChunk objects
+        """
+        text = doc_data.get('content', '')
+        # Try to get paper_id, fall back to title, then empty string
+        paper_id = doc_data.get('paper_id', doc_data.get('title', ""))
+        return self.chunk_text(text, paper_id)
+
     def chunk_text(self, text: str, paper_id: str = "") -> List[TextChunk]:
         """
         Create structured chunks from paper text.
@@ -343,6 +359,15 @@ class ResearchPaperChunker:
         # Create content chunks by sections
         content_chunks = self._create_content_chunks(text, paper_id)
         chunks.extend(content_chunks)
+        
+        # Assign unique chunk IDs
+        for i, chunk in enumerate(chunks):
+            if not chunk.chunk_id:
+                # Use paper_id + index if available, else static prefix + uuid
+                prefix = paper_id if paper_id else "chunk"
+                # Clean prefix for valid ID (no spaces/special chars)
+                clean_prefix = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', prefix)
+                chunk.chunk_id = f"{clean_prefix}_{i}"
         
         return chunks
     

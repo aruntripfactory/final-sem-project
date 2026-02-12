@@ -234,31 +234,26 @@ class SearchModeSelector:
         Returns:
             (search_mode, alpha) tuple
         """
-        st.markdown("### Search Configuration")
+        search_mode = st.radio(
+            "Search Mode",
+            ["Semantic", "Keyword", "Hybrid"],
+            horizontal=True,
+            help="Semantic: meaning-based | Keyword: exact matches | Hybrid: combines both"
+        )
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            search_mode = st.selectbox(
-                "Search Mode",
-                ["Semantic", "Keyword", "Hybrid"],
-                help="Semantic: meaning-based | Keyword: exact matches | Hybrid: combines both"
+        alpha = 0.5
+        if search_mode == "Hybrid":
+            alpha = st.slider(
+                "Semantic Weight",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.5,
+                step=0.1,
+                help="1.0 = pure semantic, 0.0 = pure keyword"
             )
-        
-        with col2:
-            alpha = 0.5
-            if search_mode == "Hybrid":
-                alpha = st.slider(
-                    "Semantic Weight",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=0.5,
-                    step=0.1,
-                    help="1.0 = pure semantic, 0.0 = pure keyword"
-                )
-            elif search_mode == "Semantic":
-                alpha = 1.0
-            else:  # Keyword
-                alpha = 0.0
+        elif search_mode == "Semantic":
+            alpha = 1.0
+        else:  # Keyword
+            alpha = 0.0
         
         return search_mode, alpha

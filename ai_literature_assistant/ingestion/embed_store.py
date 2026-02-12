@@ -28,7 +28,8 @@ def create_client():
     return client
 
 def store_documents_enhanced(chunks: List[Union[Dict[str, Any], Any]], ids: List[str], 
-                           collection_name: str = "research_papers"):
+                           collection_name: str = "research_papers",
+                           embedding_model = None):
     """
     Store documents with metadata in ChromaDB.
     Handles both dictionaries AND TextChunk dataclass objects.
@@ -37,6 +38,7 @@ def store_documents_enhanced(chunks: List[Union[Dict[str, Any], Any]], ids: List
         chunks: List of dictionaries OR TextChunk objects
         ids: List of document IDs
         collection_name: Name of the collection
+        embedding_model: Optional pre-loaded SentenceTransformer model
     """
     if not chunks:
         print("No documents to store.")
@@ -62,8 +64,8 @@ def store_documents_enhanced(chunks: List[Union[Dict[str, Any], Any]], ids: List
             metadatas.append({})
             print(f"Warning: Unexpected chunk type: {type(chunk)}")
     
-    # Load embedding model
-    model = get_embedding_model()
+    # Load embedding model if not provided
+    model = embedding_model if embedding_model else get_embedding_model()
 
     
     # Create embeddings
