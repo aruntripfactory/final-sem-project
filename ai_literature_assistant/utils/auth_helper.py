@@ -99,7 +99,7 @@ def init_session_auth():
     session_token = query_params.get('session')
     
     if session_token:
-        # Validate the session token
+        # Validate the session token from URL
         user_data = validate_session(session_token)
         
         if user_data:
@@ -110,16 +110,18 @@ def init_session_auth():
             st.session_state.session_token = session_token
         else:
             # Invalid/expired session - clear everything
+            if st.session_state.get('authenticated'):
+                st.warning("Session expired. Please log in again.")
             clear_local_session_state()
-            # Remove the invalid token from URL
             if 'session' in st.query_params:
                 del st.query_params['session']
             st.rerun()
-    
+            
     elif st.session_state.get('authenticated') and st.session_state.get('session_token'):
-        # User is authenticated in session_state but URL doesn't have token
-        # Add it to URL to persist across page loads
+        # User is authenticated in session state but URL might be missing token (e.g. manual clear)
+        # Restore token to URL to support future reloads
         st.query_params['session'] = st.session_state.session_token
+
 
 def login_user(user_id, username):
     """Log in a user and set up persistent database session"""
@@ -133,8 +135,8 @@ def login_user(user_id, username):
     st.session_state.username = username
     st.session_state.session_token = token
     
-    # Update query params
-    st.query_params['session'] = token
+    # Persist to URL to support page reloads
+    st.query_params["session"] = token
     logger.info(f"User {username} logged in with DB session")
 
 def logout_user():
@@ -151,7 +153,10 @@ def logout_user():
     logger.info("User logged out")
 
 def clear_local_session_state():
-    """Helper to clear st.session_state auth keys"""
+    """Helper to clear st.session_state auth keys and document state"""
+    # Import here to avoid potential circular imports
+    from utils.document_manager import DocumentManager
+    
     st.session_state.authenticated = False
     for key in ['user_id', 'username', 'session_token']:
         if key in st.session_state:
@@ -160,7 +165,24 @@ def clear_local_session_state():
     # Clear conversation
     st.session_state.conversation = []
     st.session_state.current_session_id = None
-
+    
+    # Clear document state
+    if 'doc_manager' in st.session_state:
+        st.session_state.doc_manager = DocumentManager()
+    
+    if 'uploaded_files' in st.session_state:
+        st.session_state.uploaded_files = set()
+        
+    if 'selected_documents' in st.session_state:
+        st.session_state.selected_documents = []
+        
+    # Clear file upload cache
+    st.session_state.pop('_uploaded_file_data', None)
+    st.session_state.pop('_uploaded_file_objects', None)
+    st.session_state.pop('reported_duplicates', None)
+    
+    # Reset to chat tab to force login prompt
+    st.session_state.current_tab = "chat"
 def cleanup_expired_sessions():
     """Clean up expired sessions from database"""
     db = SessionLocal()

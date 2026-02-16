@@ -8,20 +8,18 @@ import streamlit as st
 import os
 from datetime import datetime
 import uuid
-import hashlib
 import logging
 
 # Third-party imports
 import chromadb
 from sqlalchemy.orm import Session as DBSession
 
-# Local imports
-from ingestion.pdf_loader import extract_text_from_pdf
-from ingestion.preprocess import ResearchPaperChunker
-from ingestion.embed_store import store_documents_enhanced, CHROMA_DIR
-from ingestion.image_extractor import process_pdf_images
+# Ingestion: ONE import, ONE function call — app.py never touches
+# pdf_loader / preprocess / embed_store / image_extractor directly.
+from ingestion.ingest_all import ingest_uploaded_files, IngestResult, CHROMA_DIR
+
+# App-level concerns only
 from rag.pipeline import RAGPipeline
-from citation_generator import IEEECitationGenerator
 from auth import auth_dialog, logout
 from database import Session as ChatSession, Message, SessionLocal, init_db
 
@@ -32,7 +30,7 @@ logger = logging.getLogger(__name__)
 # ==================== CONFIGURATION ====================
 st.set_page_config(
     page_title="AI Research Literature Assistant",
-    page_icon="📚",
+    page_icon="",
     layout="wide"
 )
 
@@ -226,185 +224,56 @@ def save_message(role, content, sources=None):
     finally:
         db.close()
 
-def _process_single_file(file_name, file_content, doc_manager):
-    """Process a single PDF file (thread-safe, no Streamlit calls)."""
-    import io
-    from pypdf import PdfReader
-    
-    file_size = len(file_content)
-    
-    if doc_manager.document_exists(file_name, file_size):
-        return None  # Skip already processed
-    
-    file_hash = hashlib.md5(file_content).hexdigest()[:12]
-    
-    doc_info = doc_manager.add_document(file_name, file_size, file_hash)
-    
-    # Count pages first
-    try:
-        reader = PdfReader(io.BytesIO(file_content))
-        num_pages = len(reader.pages)
-    except Exception:
-        num_pages = 0
-    
-    # Extract text from PDF (with cleaning)
-    text = extract_text_from_pdf(file_content)
-    
-    # Chunk the document
-    chunker = ResearchPaperChunker()
-    chunks = chunker.chunk_document({
-        'content': text,
-        'paper_id': file_hash,
-        'title': file_name
-    })
-    
-    # Update document manager with page count and chunk count
-    doc_manager.update_document(
-        file_hash, 
-        status='completed',
-        num_chunks=len(chunks),
-        num_pages=num_pages
-    )
-    
-    logger.info(f"Processed '{file_name}': {num_pages} pages, {len(chunks)} chunks, {len(text)} chars")
-    
-    return {
-        'file_name': file_name,
-        'file_hash': file_hash,
-        'file_content': file_content,  # Keep bytes for image extraction
-        'chunks': chunks,
-        'num_pages': num_pages,
-    }
-
-
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_embedding_model():
-    """Load the embedding model once and cache it."""
+    """Load sentence-transformer once per process, reused by ingestion."""
     try:
         from sentence_transformers import SentenceTransformer
         return SentenceTransformer("all-MiniLM-L6-v2")
     except Exception as e:
-        logger.error(f"Error loading embedding model: {e}")
+        logger.error(f"[APP] Embedding model load failed: {e}")
         return None
 
-def process_uploaded_files(uploaded_files) -> bool:
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    
-    try:
-        # Load model early to ensure it's ready
-        embedding_model = load_embedding_model()
-        if not embedding_model:
-            st.error("Failed to load embedding model.")
-            return False
 
-        # Pre-read all file contents (must happen in main thread)
-        file_data = []
-        for f in uploaded_files:
-            content = f.read()
-            file_data.append((f.name, content))
-        
-        total = len(file_data)
-        progress_bar = st.progress(0, text="Starting parallel processing...")
-        status_text = st.empty()
-        
-        all_chunks = []
-        all_chunk_ids = []
-        processed_results = []  # Store results for image extraction phase
-        completed = 0
-        
-        # ── Phase 1: Text extraction & chunking (parallel) ──
-        with ThreadPoolExecutor(max_workers=min(2, total)) as executor:
-            futures = {
-                executor.submit(
-                    _process_single_file, name, content, st.session_state.doc_manager
-                ): name 
-                for name, content in file_data
-            }
-            
-            for future in as_completed(futures):
-                file_name = futures[future]
-                completed += 1
-                
-                try:
-                    result = future.result()
-                    if result:
-                        for chunk in result['chunks']:
-                            all_chunks.append(chunk)
-                            all_chunk_ids.append(chunk.chunk_id)
-                        st.session_state.uploaded_files.add(result['file_name'])
-                        processed_results.append(result)
-                        status_text.text(f"✅ {result['file_name']} (text extracted)")
-                    else:
-                        status_text.text(f"⏭️ {file_name} (already processed)")
-                except Exception as e:
-                    status_text.text(f"❌ {file_name}: {str(e)}")
-                    logger.error(f"Error processing {file_name}: {e}")
-                
-                progress_bar.progress(
-                    (completed / total) * 0.5,
-                    text=f"📄 Extracting text: {completed}/{total} files..."
-                )
-        
-        # ── Phase 2: Image extraction & Vision analysis (sequential per file) ──
-        if processed_results:
-            status_text.text("🖼️ Extracting and analyzing images...")
-            image_chunk_count = 0
-            
-            for idx, result in enumerate(processed_results):
-                file_content = result.get('file_content')
-                file_hash = result['file_hash']
-                file_name = result['file_name']
-                
-                if file_content:
-                    try:
-                        progress_bar.progress(
-                            0.5 + (idx / len(processed_results)) * 0.3,
-                            text=f"🖼️ Analyzing images in {file_name}..."
-                        )
-                        
-                        image_chunks = process_pdf_images(
-                            pdf_source=file_content,
-                            paper_id=file_hash,
-                            max_images=10,
-                        )
-                        
-                        for ic in image_chunks:
-                            chunk_id = f"{file_hash}_img_{image_chunk_count}"
-                            all_chunks.append(ic)
-                            all_chunk_ids.append(chunk_id)
-                            image_chunk_count += 1
-                        
-                        if image_chunks:
-                            status_text.text(
-                                f"🖼️ {file_name}: {len(image_chunks)} images analyzed"
-                            )
-                    except Exception as e:
-                        logger.warning(f"Image extraction failed for {file_name}: {e}")
-                        status_text.text(f"⚠️ {file_name}: image extraction skipped")
-            
-            if image_chunk_count > 0:
-                logger.info(f"Total image chunks created: {image_chunk_count}")
-        
-        # ── Phase 3: Generate embeddings & store in ChromaDB ──
-        if all_chunks:
-            progress_bar.progress(0.85, text="💾 Generating embeddings...")
-            status_text.text(f"Generating embeddings for {len(all_chunks)} chunks...")
-            
-            store_documents_enhanced(all_chunks, all_chunk_ids, embedding_model=embedding_model)
-            
-            progress_bar.progress(1.0, text="✅ All done!")
-            status_text.empty()
-            return True
-        
-        progress_bar.progress(1.0, text="✅ Complete (no new files to process)")
-        status_text.empty()
-        return False
-            
-    except Exception as e:
-        import traceback
-        logger.error(f"Error processing files: {str(e)}\n{traceback.format_exc()}")
-        st.error(f"Error processing files: {str(e)}")
-        return False
+def _process_and_ingest(file_data: list) -> bool:
+    """
+    Hand uploaded file bytes to the ingestion layer.
+    app.py does NOT touch pdf_loader / preprocess / embed_store directly.
+    """
+    progress_bar = st.progress(0, text="Starting…")
+    status_text  = st.empty()
+
+    def on_progress(fraction: float, msg: str):
+        progress_bar.progress(fraction, text=f"{msg}")
+        status_text.text(msg)
+
+    # Important: ensure any cached Chroma/RAG resources are released before writing.
+    # This prevents stale sqlite handles after CHROMA_DIR was cleared elsewhere.
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+    result: IngestResult = ingest_uploaded_files(
+        files=file_data,
+        doc_manager=st.session_state.doc_manager,
+        embedding_model=load_embedding_model(),
+        chunk_size=1800,
+        overlap=80,
+        max_workers=8,
+        max_images=10 if st.session_state.get("process_images", False) else 0,
+        progress_cb=on_progress,
+    )
+
+    progress_bar.progress(1.0, text="Done")
+    status_text.empty()
+
+    if result.failed:
+        st.warning(f"Failed to process: {', '.join(result.failed)}")
+    if result.skipped:
+        st.info(f"Already processed (skipped): {', '.join(result.skipped)}")
+
+    return result.success
 
 def render_chat_message(qa: dict):
     with st.chat_message(qa["role"]):
@@ -419,7 +288,7 @@ def render_chat_message(qa: dict):
                     st.image(img_path, caption=caption, use_container_width=True)
         
         if st.session_state.show_sources and qa.get("sources"):
-            with st.expander("📎 Sources & Figures"):
+            with st.expander("Sources & Figures"):
                 for i, source in enumerate(qa["sources"][:5]):
                     meta = source.get("metadata", {})
                     chunk_type = meta.get("chunk_type", "content")
@@ -431,7 +300,7 @@ def render_chat_message(qa: dict):
                     if chunk_type == "image_description":
                         image_path = meta.get("image_path", "")
                         page = meta.get("page_start", "?")
-                        st.markdown(f"**🖼️ Figure (Page {page}):**")
+                        st.markdown(f"**Figure (Page {page}):**")
                         if image_path and os.path.exists(image_path):
                             st.image(image_path, use_container_width=True)
                         # Show the description below the image
@@ -483,17 +352,20 @@ btn_padding = "0.5rem 1rem" if st.session_state.sidebar_expanded else "0rem"
 btn_align = "left" if st.session_state.sidebar_expanded else "center"
 btn_justify = "flex-start" if st.session_state.sidebar_expanded else "center"
 
+# Inject dynamic CSS variables for sidebar state
 st.markdown(f"""
     <style>
     :root {{
-        --sidebar-width: {sidebar_width};
-        --sidebar-text-align: {sidebar_align};
-        --sidebar-btn-padding: {btn_padding};
-        --sidebar-btn-content-align: {btn_align};
-        --sidebar-btn-justify: {btn_justify};
+        --sidebar-width: {sidebar_width} !important;
+        --sidebar-text-align: {sidebar_align} !important;
+        --sidebar-btn-padding: {btn_padding} !important;
+        --sidebar-btn-content-align: {btn_align} !important;
+        --sidebar-btn-justify: {btn_justify} !important;
     }}
     </style>
 """, unsafe_allow_html=True)
+
+
 
 with st.sidebar:
     # Custom sidebar toggle with panel icon (CSS provides the SVG)
@@ -505,6 +377,7 @@ with st.sidebar:
     if st.session_state.sidebar_expanded:
         if st.button("Chat", key="nav-chat", help="Chat", use_container_width=True):
             st.session_state.current_tab = "chat"
+            st.session_state.is_history_view = False
             st.rerun()
         
         if st.button("Documents", key="nav-docs", help="Documents", use_container_width=True):
@@ -519,11 +392,42 @@ with st.sidebar:
             st.session_state.current_tab = "export"
             st.rerun()
         
+
+        
+        # EXPORT TAB REMOVED AS REQUESTED
+        
         if st.session_state.authenticated:
             if st.button("New Session", key="nav-new-session", help="Start New Session", use_container_width=True):
+                # Clear session state
                 st.session_state.conversation = []
                 st.session_state.current_session_id = None
                 st.session_state.doc_manager = DocumentManager()
+                st.session_state.is_history_view = False  # Reset history view
+                
+                # Clear uploaded files cache
+                st.session_state.pop('_uploaded_file_data', None)
+                st.session_state.pop('_uploaded_file_objects', None)
+
+                # Clear extracted images cache
+                try:
+                    import shutil
+                    images_dir = os.path.join(os.path.dirname(__file__), "data", "images")
+                    if os.path.exists(images_dir):
+                        shutil.rmtree(images_dir)
+                    os.makedirs(images_dir, exist_ok=True)
+                except Exception as e:
+                    logger.error(f"Failed to clear extracted images: {e}")
+                
+                # Clear ChromaDB to keep it fresh for the new session
+                try:
+                    import shutil
+                    st.cache_resource.clear()
+                    if os.path.exists(CHROMA_DIR):
+                        shutil.rmtree(CHROMA_DIR)
+                        os.makedirs(CHROMA_DIR, exist_ok=True)
+                except Exception as e:
+                    logger.error(f"Failed to clear ChromaDB: {e}")
+                
                 st.session_state.current_tab = "chat"
                 st.rerun()
             
@@ -541,15 +445,17 @@ with st.sidebar:
                 
                 for s in user_sessions:
                     label = s.title if s.title else "New Chat"
-                    if len(label) > 18:
-                        label = label[:16] + "..."
+                    if len(label) > 15:
+                        label = label[:13] + "..."
                     
                     if st.button(label, key=f"hist_{s.id}", use_container_width=True):
                         # Only load session if we're NOT in the middle of a toggle rerun
                         if not is_toggling:
                             load_chat_session(s.id)
                             st.session_state.current_tab = "chat"
+                            st.session_state.is_history_view = True  # Mark as history view (read-only)
                             st.rerun()
+
                 db.close()
             except Exception as e:
                 logger.error(f"Failed to load history: {e}")
@@ -557,6 +463,7 @@ with st.sidebar:
     else:
         if st.button(".", key="nav-chat-icon", help="Chat"):
             st.session_state.current_tab = "chat"
+            st.session_state.is_history_view = False
             st.rerun()
         
         if st.button(".", key="nav-docs-icon", help="Documents"):
@@ -573,9 +480,36 @@ with st.sidebar:
         
         if st.session_state.authenticated:
             if st.button(".", key="nav-new-session-icon", help="Start New Session"):
+                # Clear session state
                 st.session_state.conversation = []
                 st.session_state.current_session_id = None
                 st.session_state.doc_manager = DocumentManager()
+                st.session_state.is_history_view = False  # Reset history view
+                
+                # Clear uploaded files cache
+                st.session_state.pop('_uploaded_file_data', None)
+                st.session_state.pop('_uploaded_file_objects', None)
+
+                # Clear extracted images cache
+                try:
+                    import shutil
+                    images_dir = os.path.join(os.path.dirname(__file__), "data", "images")
+                    if os.path.exists(images_dir):
+                        shutil.rmtree(images_dir)
+                    os.makedirs(images_dir, exist_ok=True)
+                except Exception as e:
+                    logger.error(f"Failed to clear extracted images: {e}")
+                
+                # Clear ChromaDB to keep it fresh for the new session
+                try:
+                    import shutil
+                    st.cache_resource.clear()
+                    if os.path.exists(CHROMA_DIR):
+                        shutil.rmtree(CHROMA_DIR)
+                        os.makedirs(CHROMA_DIR, exist_ok=True)
+                except Exception as e:
+                    logger.error(f"Failed to clear ChromaDB: {e}")
+                
                 st.session_state.current_tab = "chat"
                 st.rerun()
 
@@ -587,132 +521,129 @@ st.markdown("""
     </div>
 """, unsafe_allow_html=True)
 
+# Export button below header - only show if authenticated and has conversation
+if st.session_state.authenticated and st.session_state.conversation:
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col3:
+        if st.button("Export", key="export-btn-header", help="Export chat history", use_container_width=True):
+            st.session_state.current_tab = "export"
+            st.rerun()
+
 # ==================== CHAT TAB ====================
 if st.session_state.current_tab == "chat":
-    if st.session_state.doc_manager.get_document_count() == 0:
-        if not st.session_state.authenticated:
-            with st.container(key="auth-trigger-upload"):
-                if st.button("Login\nto Upload Research PDFs", key="auth-btn-trigger", type="primary"):
-                    auth_dialog()
-        else:
-            with st.container(key="authenticated-upload"):
-                uploaded_files = st.file_uploader(
-                    "Upload Research PDFs",
-                    type=["pdf"],
-                    accept_multiple_files=True,
-                    key="uploader-component"
-                )
-            
-            # Cache uploaded file data in session state so it survives sidebar toggle reruns
-            if uploaded_files:
-                cached_files = []
-                seen_names = set()
-                duplicate_names = set()
-                for f in uploaded_files:
-                    if f.name not in seen_names:
-                        seen_names.add(f.name)
-                        content = f.read()
-                        cached_files.append({"name": f.name, "content": content, "size": len(content)})
-                        f.seek(0)  # Reset for later use
-                    else:
-                        duplicate_names.add(f.name)
-                st.session_state._uploaded_file_data = cached_files
-                st.session_state._uploaded_file_objects = uploaded_files
-                if duplicate_names:
-                    already_reported = st.session_state.get("reported_duplicates", set())
-                    new_dupes = duplicate_names - already_reported
-                    if new_dupes:
-                        st.session_state.reported_duplicates = already_reported | new_dupes
-                        st.toast(f"{len(new_dupes)} duplicate file(s) removed from selection.", icon="⚠️")
+    # Check if pipeline exists (persistent on disk) even if doc_manager (in-memory) is empty
+    pipeline_status = get_rag_pipeline()
+    
+    # If we have a pipeline with documents, but doc_manager is empty (e.g. after reload),
+    # we should restore the "chat" view instead of showing upload prompt.
+    # However, we won't visually populate the "Document Library" tab without metadata logic,
+    # but the chat will work.
+    is_history = st.session_state.get('is_history_view', False)
+    has_documents = st.session_state.doc_manager.get_document_count() > 0 or (pipeline_status is not None) or is_history
+
+    if not st.session_state.authenticated:
+        _, col_center, _ = st.columns([1, 2, 1])
+        with col_center:
+            if st.button("Login\nto Upload Research PDFs", key="auth-btn-trigger", type="primary", use_container_width=True):
+                auth_dialog()
+
+    elif not has_documents:
+        with st.container(key="authenticated-upload"):
+            uploaded_files = st.file_uploader(
+                "Upload Research PDFs",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key="uploader-component"
+            )
+
+            st.checkbox(
+                "Process images (slower)",
+                key="process_images",
+                value=False,
+            )
+        
+        # Cache uploaded file data in session state so it survives sidebar toggle reruns
+        if uploaded_files:
+            cached_files = []
+            seen_names = set()
+            duplicate_names = set()
+            for f in uploaded_files:
+                if f.name not in seen_names:
+                    seen_names.add(f.name)
+                    content = f.read()
+                    cached_files.append({"name": f.name, "content": content, "size": len(content)})
+                    f.seek(0)  # Reset for later use
                 else:
-                    st.session_state.pop("reported_duplicates", None)
-            
-            # Display selected files from cache (survives sidebar toggle)
-            cached = st.session_state.get('_uploaded_file_data', [])
-            if cached:
-                with st.container(key="selected-files-list-section"):
-                    st.markdown("---")
-                    st.markdown("### Selected Documents")
-                    
-                    for fd in cached:
-                        size_mb = fd["size"] / 1024 / 1024
-                        st.markdown(f"**{fd['name']}** ({size_mb:.2f} MB)")
-                    
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("Process Documents", key="process-docs-btn"):
-                        # Show full-screen processing overlay with animated SVG
-                        st.markdown("""
-                        <style>
-                        .processing-overlay {
-                            position: fixed;
-                            top: 0; left: 0; right: 0; bottom: 0;
-                            background: rgba(0, 0, 0, 0.85);
-                            z-index: 9999999;
-                            display: flex;
-                            flex-direction: column;
-                            align-items: center;
-                            justify-content: center;
-                            gap: 1.5rem;
-                            animation: fadeIn 0.3s ease;
-                        }
-                        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-                        @keyframes pulse { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
-                        .processing-text {
-                            color: #e0e0e0;
-                            font-family: 'Inter', sans-serif;
-                            font-size: 1.2rem;
-                            font-weight: 500;
-                            animation: pulse 2s ease-in-out infinite;
-                            margin-top: 1rem;
-                        }
-                        .processing-subtext {
-                            color: #888;
-                            font-family: 'Inter', sans-serif;
-                            font-size: 0.9rem;
-                        }
-                        .custom-spinner {
-                            width: 100px;
-                            height: 50px;
-                        }
-                        </style>
-                        <div class="processing-overlay">
-                            <div class="custom-spinner">
-                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 150">
-                                    <path fill="none" stroke="#6B7280" stroke-width="15" stroke-linecap="round" stroke-dasharray="300 385" stroke-dashoffset="0" d="M275 75c0 31-27 50-50 50-58 0-92-100-150-100-28 0-50 22-50 50s23 50 50 50c58 0 92-100 150-100 24 0 50 19 50 50Z">
-                                        <animate attributeName="stroke-dashoffset" calcMode="spline" dur="2" values="685;-685" keySplines="0 0 1 1" repeatCount="indefinite"></animate>
-                                    </path>
-                                </svg>
-                            </div>
-                            <div class="processing-text">Processing Documents...</div>
-                            <div class="processing-subtext">Extracting text, analyzing images & building embeddings</div>
+                    duplicate_names.add(f.name)
+            st.session_state._uploaded_file_data = cached_files
+            st.session_state._uploaded_file_objects = uploaded_files
+            if duplicate_names:
+                already_reported = st.session_state.get("reported_duplicates", set())
+                new_dupes = duplicate_names - already_reported
+                if new_dupes:
+                    st.session_state.reported_duplicates = already_reported | new_dupes
+                    st.toast(f"{len(new_dupes)} duplicate file(s) removed from selection.")
+            else:
+                st.session_state.pop("reported_duplicates", None)
+        
+        # Display selected files from cache (survives sidebar toggle)
+        cached = st.session_state.get('_uploaded_file_data', [])
+        if cached:
+            with st.container(key="selected-files-list-section"):
+                st.markdown("---")
+                st.markdown("### Selected Documents")
+                
+                for fd in cached:
+                    size_mb = fd["size"] / 1024 / 1024
+                    st.markdown(f"**{fd['name']}** ({size_mb:.2f} MB)")
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Process Documents", key="process-docs-btn"):
+                    # Show full-screen processing overlay
+                    st.markdown("""
+                    <div class="processing-overlay">
+                        <div class="custom-spinner">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 150">
+                                <path fill="none" stroke="#6B7280" stroke-width="15" stroke-linecap="round" stroke-dasharray="300 385" stroke-dashoffset="0" d="M275 75c0 31-27 50-50 50-58 0-92-100-150-100-28 0-50 22-50 50s23 50 50 50c58 0 92-100 150-100 24 0 50 19 50 50Z">
+                                    <animate attributeName="stroke-dashoffset" calcMode="spline" dur="2" values="685;-685" keySplines="0 0 1 1" repeatCount="indefinite"></animate>
+                                </path>
+                            </svg>
                         </div>
-                        """, unsafe_allow_html=True)
-                        
-                        # Use cached file objects if available, otherwise fall back
-                        files_to_process = st.session_state.get('_uploaded_file_objects', uploaded_files)
-                        if files_to_process:
-                             # Use fewer threads to avoid memory crashes
-                            if process_uploaded_files(files_to_process):
-                                # Clear cached file data after successful processing
-                                st.session_state.pop('_uploaded_file_data', None)
-                                st.session_state.pop('_uploaded_file_objects', None)
-                                st.success("Documents processed successfully!")
-                                st.cache_resource.clear()  # Force reload of RAG pipeline
-                                st.rerun()
-                            else:
-                                st.error("Processing failed or no new files to process.")
+                        <div class="processing-text">Processing Documents...</div>
+                        <div class="processing-subtext">Extracting text, analyzing images & building embeddings</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # ── Hand off to ingestion layer — app.py stops here ──
+                    success = _process_and_ingest(cached)
+                    if success:
+                        st.session_state.pop('_uploaded_file_data', None)
+                        st.session_state.pop('_uploaded_file_objects', None)
+                        st.success("Documents processed successfully!")
+                        get_rag_pipeline.clear()
+                        st.rerun()
+                    else:
+                        st.error("Processing failed or no new files to process.")
     else:
-        with st.expander("Search Settings"):
-            search_mode, alpha = SearchModeSelector.show()
-            st.session_state.search_mode = search_mode
-            st.session_state.alpha = alpha
-            show_sources = st.checkbox("Show source citations", value=st.session_state.show_sources)
-            st.session_state.show_sources = show_sources
+        if not st.session_state.get('is_history_view', False):
+            st.markdown("### Search Settings")
+            with st.container():
+                search_mode, alpha = SearchModeSelector.show()
+                st.session_state.search_mode = search_mode
+                st.session_state.alpha = alpha
+                show_sources = st.checkbox("Show source citations", value=st.session_state.show_sources)
+                st.session_state.show_sources = show_sources
+            
+        st.markdown("<div style='margin-bottom: 3rem;'></div>", unsafe_allow_html=True)
 
         for qa in st.session_state.conversation:
             render_chat_message(qa)
-
-        user_query = st.chat_input("Ask a question about your documents...")
+            
+        if st.session_state.get('is_history_view', False):
+            st.info("This is a past conversation. Start a new session to ask more questions.")
+            user_query = None
+        else:
+            user_query = st.chat_input("Ask a question about your documents...")
         
         if user_query:
             pipeline = get_rag_pipeline()
@@ -721,8 +652,8 @@ if st.session_state.current_tab == "chat":
                 # Custom SVG spinner for "Thinking" state
                 spinner_placeholder = st.empty()
                 spinner_placeholder.markdown("""
-                    <div style="display: flex; justify-content: center; align-items: center; margin: 2rem 0; width: 100%;">
-                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" style="width: 60px; height: 60px;">
+                    <div class="thinking-spinner-container">
+                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" class="thinking-spinner-svg">
                             <circle fill="#6B7280" stroke="#6B7280" stroke-width="15" r="15" cx="40" cy="65">
                                 <animate attributeName="cy" calcMode="spline" dur="2" values="65;135;65;" keySplines=".5 0 .5 1;.5 0 .5 1" repeatCount="indefinite" begin="-.4"></animate>
                             </circle>
@@ -807,32 +738,39 @@ elif st.session_state.current_tab == "compare":
 
 # ==================== EXPORT TAB ====================
 elif st.session_state.current_tab == "export":
-    st.subheader("Export Chat History")
+    st.header("Export Chat History")
+    
+    st.subheader("Export Document")
 
     if st.session_state.conversation:
         exporter = ChatExporter()
         
         format_type = st.selectbox("Select export format:", ["JSON", "CSV", "TXT"])
         
-        if st.button("Export Chat", type="primary"):
-            try:
-                path = exporter.export_chat(
-                    st.session_state.conversation,
-                    format_type.lower(),
-                    st.session_state.session_id
-                )
-                
-                st.success("Export ready!")
-                
-                with open(path, 'r') as f:
-                    st.download_button(
-                        "Download File",
-                        f.read(),
-                        file_name=f"chat_export_{st.session_state.session_id}.{format_type.lower()}",
-                        mime=f"text/{format_type.lower()}"
-                    )
-            except Exception as e:
-                st.error(f"Export failed: {e}")
+        try:
+            # Generate the file content for the current format
+            path = exporter.export_chat(
+                st.session_state.conversation,
+                format_type.lower(),
+                st.session_state.session_id
+            )
+            
+            with open(path, 'r', encoding='utf-8') as f:
+                file_data = f.read()
+            
+            # Use the download button directly - it will have the emerald green color via CSS key
+            st.download_button(
+                label="Export Chat",
+                data=file_data,
+                file_name=f"chat_export_{st.session_state.session_id}.{format_type.lower()}",
+                mime=f"text/{format_type.lower()}",
+                key="export-chat-btn",
+                type="primary",
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"Export could not be prepared: {e}")
+
     else:
         st.info("No chat history to export. Start a conversation first!")
 

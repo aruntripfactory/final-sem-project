@@ -1,7 +1,10 @@
 import streamlit as st
 import bcrypt
+import os
+import shutil
 from database import SessionLocal, User, init_db
 from utils.auth_helper import login_user, logout_user
+from ingestion.ingest_all import CHROMA_DIR
 
 # Initialize database
 init_db()
@@ -44,6 +47,16 @@ def login_form():
                 user = db.query(User).filter(User.username == username).first()
                 if user:
                     if verify_password(password, user.password_hash):
+                        # Clear ChromaDB to keep it fresh for the new session
+                        try:
+                            if os.path.exists(CHROMA_DIR):
+                                shutil.rmtree(CHROMA_DIR)
+                                os.makedirs(CHROMA_DIR, exist_ok=True)
+                            st.cache_resource.clear()
+                        except Exception as e:
+                            # Log error but allow login to proceed
+                            print(f"Failed to clear ChromaDB: {e}")
+
                         # Use the new login system
                         login_user(user.id, user.username)
                         st.success(f"Welcome back, {username}!")

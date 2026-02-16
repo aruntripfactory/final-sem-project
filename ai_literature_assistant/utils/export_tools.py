@@ -27,65 +27,27 @@ class ChatExporter:
         self,
         chat_history: List[Dict],
         filename: str = "chat_export.pdf",
-        include_metadata: bool = True
+        include_metadata: bool = False
     ) -> str:
-        """
-        Export chat history to PDF
-        
-        Args:
-            chat_history: List of chat exchanges
-            filename: Output filename
-            include_metadata: Whether to include document metadata
-            
-        Returns:
-            Path to generated PDF file
-        """
+        """Export simplified chat history to PDF (Q&A only)"""
         pdf = FPDF()
         pdf.add_page()
         pdf.set_auto_page_break(auto=True, margin=15)
         
-        # Title
-        pdf.set_font("Arial", 'B', 16)
-        pdf.cell(0, 10, txt="Research Chat Export", ln=True, align='C')
-        pdf.ln(5)
+        pdf.set_font("Arial", '', 11)
         
-        # Export metadata
-        pdf.set_font("Arial", 'I', 10)
-        pdf.cell(0, 5, txt=f"Exported: {self.export_metadata['export_time'].strftime('%Y-%m-%d %H:%M')}", ln=True)
-        pdf.ln(10)
-        
-        # Chat history
         for i, entry in enumerate(chat_history, 1):
-            # Question
-            pdf.set_font("Arial", 'B', 12)
-            question_text = f"Q{i}: {entry.get('question', entry.get('query', 'N/A'))}"
-            pdf.multi_cell(0, 8, txt=self._clean_text(question_text))
-            pdf.ln(2)
+            role = entry.get('role', 'unknown').capitalize()
+            content = entry.get('content', 'N/A')
             
-            # Answer
-            pdf.set_font("Arial", '', 11)
-            answer_text = entry.get('answer', entry.get('response', 'N/A'))
-            pdf.multi_cell(0, 7, txt=self._clean_text(answer_text))
-            pdf.ln(2)
-            
-            # Sources if available
-            if 'sources' in entry and entry['sources']:
-                pdf.set_font("Arial", 'I', 9)
-                sources_text = f"Sources: {', '.join(str(s) for s in entry['sources'][:3])}"
-                pdf.multi_cell(0, 5, txt=self._clean_text(sources_text))
-            
-            # Confidence if available
-            if 'confidence' in entry:
-                pdf.set_font("Arial", 'I', 9)
-                pdf.cell(0, 5, txt=f"Confidence: {entry['confidence']:.1f}%", ln=True)
-            
+            # Format as: [Role] Content
+            text = f"[{role}] {content}"
+            pdf.multi_cell(0, 7, txt=self._clean_text(text))
             pdf.ln(5)
             
-            # Add page break if needed
-            if pdf.get_y() > 250:
+            if pdf.get_y() > 270:
                 pdf.add_page()
         
-        # Save PDF
         pdf.output(filename)
         return filename
     
@@ -93,68 +55,20 @@ class ChatExporter:
         self,
         chat_history: List[Dict],
         filename: str = "chat_export.docx",
-        include_metadata: bool = True
+        include_metadata: bool = False
     ) -> str:
-        """
-        Export chat history to Word document
-        
-        Args:
-            chat_history: List of chat exchanges
-            filename: Output filename
-            include_metadata: Whether to include document metadata
-            
-        Returns:
-            Path to generated Word file
-        """
+        """Export simplified chat history to Word (Q&A only)"""
         doc = Document()
         
-        # Title
-        title = doc.add_heading('Research Chat Export', 0)
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        # Metadata
-        if include_metadata:
-            metadata_para = doc.add_paragraph()
-            metadata_para.add_run(
-                f"Exported: {self.export_metadata['export_time'].strftime('%Y-%m-%d %H:%M')}"
-            ).italic = True
-            metadata_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            doc.add_paragraph()
-        
-        # Chat history
-        for i, entry in enumerate(chat_history, 1):
-            # Question
-            q_para = doc.add_paragraph()
-            q_run = q_para.add_run(f"Q{i}: {entry.get('question', entry.get('query', 'N/A'))}")
-            q_run.bold = True
-            q_run.font.size = Pt(12)
-            q_run.font.color.rgb = RGBColor(31, 119, 180)
+        for entry in chat_history:
+            role = entry.get('role', 'unknown').capitalize()
+            content = entry.get('content', 'N/A')
             
-            # Answer
-            a_para = doc.add_paragraph(entry.get('answer', entry.get('response', 'N/A')))
-            a_para.paragraph_format.left_indent = Inches(0.25)
+            p = doc.add_paragraph()
+            run = p.add_run(f"[{role}] ")
+            run.bold = True
+            p.add_run(content)
             
-            # Sources
-            if 'sources' in entry and entry['sources']:
-                sources_para = doc.add_paragraph()
-                sources_run = sources_para.add_run(
-                    f"Sources: {', '.join(str(s) for s in entry['sources'][:3])}"
-                )
-                sources_run.italic = True
-                sources_run.font.size = Pt(9)
-                sources_para.paragraph_format.left_indent = Inches(0.25)
-            
-            # Confidence
-            if 'confidence' in entry:
-                conf_para = doc.add_paragraph()
-                conf_run = conf_para.add_run(f"Confidence: {entry['confidence']:.1f}%")
-                conf_run.italic = True
-                conf_run.font.size = Pt(9)
-                conf_para.paragraph_format.left_indent = Inches(0.25)
-            
-            doc.add_paragraph()
-        
-        # Save document
         doc.save(filename)
         return filename
     
@@ -163,30 +77,14 @@ class ChatExporter:
         chat_history: List[Dict],
         filename: str = "chat_export.csv"
     ) -> str:
-        """
-        Export chat history to CSV
-        
-        Args:
-            chat_history: List of chat exchanges
-            filename: Output filename
-            
-        Returns:
-            Path to generated CSV file
-        """
-        # Prepare data
+        """Export simplified chat history to CSV (Q&A only)"""
         data = []
-        for i, entry in enumerate(chat_history, 1):
-            row = {
-                'ID': i,
-                'Question': entry.get('question', entry.get('query', 'N/A')),
-                'Answer': entry.get('answer', entry.get('response', 'N/A')),
-                'Confidence': entry.get('confidence', ''),
-                'Sources': ', '.join(str(s) for s in entry.get('sources', [])),
-                'Timestamp': entry.get('timestamp', self.export_metadata['export_time'])
-            }
-            data.append(row)
+        for entry in chat_history:
+            data.append({
+                'Role': entry.get('role', 'unknown').capitalize(),
+                'Content': entry.get('content', 'N/A')
+            })
         
-        # Create DataFrame and save
         df = pd.DataFrame(data)
         df.to_csv(filename, index=False, encoding='utf-8')
         return filename
@@ -225,6 +123,71 @@ class ChatExporter:
         
         return filename
     
+    def export_to_json(
+        self,
+        chat_history: List[Dict],
+        filename: str = "chat_export.json"
+    ) -> str:
+        """Export simplified chat history to JSON"""
+        import json
+        data = []
+        for entry in chat_history:
+            data.append({
+                'role': entry.get('role', 'unknown'),
+                'content': entry.get('content', '')
+            })
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return filename
+
+    def export_to_txt(
+        self,
+        chat_history: List[Dict],
+        filename: str = "chat_export.txt"
+    ) -> str:
+        """Export simplified chat history to TXT (Q&A only)"""
+        with open(filename, 'w', encoding='utf-8') as f:
+            for entry in chat_history:
+                role = entry.get('role', 'unknown').upper()
+                content = entry.get('content', '')
+                f.write(f"[{role}] {content}\n\n")
+        return filename
+
+    def export_chat(
+        self,
+        chat_history: List[Dict],
+        format_type: str = "txt",
+        session_id: str = "current"
+    ) -> str:
+        """
+        Unified export method
+        
+        Args:
+            chat_history: List of chat messages
+            format_type: One of 'json', 'csv', 'txt', 'pdf', 'docx'
+            session_id: Session identifier for filename
+            
+        Returns:
+            Path to the exported file
+        """
+        format_type = format_type.lower()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"chat_export_{session_id}_{timestamp}.{format_type}"
+        
+        if format_type == 'json':
+            return self.export_to_json(chat_history, filename)
+        elif format_type == 'csv':
+            return self.export_to_csv(chat_history, filename)
+        elif format_type == 'txt':
+            return self.export_to_txt(chat_history, filename)
+        elif format_type == 'pdf':
+            return self.export_to_pdf(chat_history, filename)
+        elif format_type == 'docx':
+            return self.export_to_word(chat_history, filename)
+        else:
+            # Default to TXT
+            return self.export_to_txt(chat_history, filename.replace(f'.{format_type}', '.txt'))
+
     def _clean_text(self, text: str) -> str:
         """Clean text for PDF export (remove problematic characters)"""
         if not text:

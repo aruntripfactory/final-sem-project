@@ -109,8 +109,8 @@ def store_documents_enhanced(
     logger.info(f"[EMBED_STORE] Generating embeddings for {len(texts)} chunks...")
     embeddings = model.encode(
         texts,
-        batch_size=32,
-        show_progress_bar=True,
+        batch_size=64,
+        show_progress_bar=False,
         normalize_embeddings=True,
     ).tolist()
 

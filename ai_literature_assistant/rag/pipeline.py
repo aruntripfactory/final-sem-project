@@ -11,6 +11,7 @@ from config import (
     OPENAI_MODEL,
     OPENAI_TEMPERATURE,
     MAX_RETRIEVAL_RESULTS,
+    MAX_CONTEXT_LENGTH,
 )
 from rag.retriever import RAGRetriever
 from rag.response_generator import ResponseGenerator
@@ -59,8 +60,11 @@ class RAGPipeline:
 
         print(f"\nProcessing query: {question}")
         
-        # --- QUERY ROUTING ---
-        # Detect if user wants to list papers (Catalog Query)
+        # --- AUTO-INTELLIGENCE ROUTING ---
+        mode = "MULTI_PAPER"
+        target_paper_id = None
+        
+        # 1. Check for Catalog Query (Explicit list requests)
         low_q = question.lower().strip().rstrip('?')
         catalog_keywords = [
             "list papers", "all papers", "list all papers", "what papers", "show papers", 
@@ -71,17 +75,74 @@ class RAGPipeline:
         is_catalog_query = any(keyword in low_q for keyword in catalog_keywords) or low_q == "papers"
         
         if is_catalog_query:
-            print(f"Detecting catalog query: '{question}'. Routing to metadata retrieval.")
-            # Retrieve all title references
+            mode = "CATALOG"
+        else:
+            title_search = self.retriever.retrieve(
+                query=question,
+                n_results=1,
+                filter_by={"chunk_type": "title_reference"}
+            )
+            
+            if title_search["success"] and title_search["results"]:
+                top_match = title_search["results"][0]
+                similarity = top_match["similarity_score"]
+                
+                print(f"Auto-Intel: Top title match: '{top_match['content']}' (Score: {similarity:.2f})")
+                
+                # If high confidence match, assume Single Paper Mode
+                if similarity > 0.75:
+                    mode = "SINGLE_PAPER"
+                    target_paper_id = top_match["metadata"]["paper_id"]
+                    print(f"Auto-Intel: Detected SINGLE_PAPER intent for '{top_match['content']}'")
+
+        # --- EXECUTION BASED ON MODE ---
+        
+        if mode == "CATALOG":
+            print(f"Routing to CATALOG retrieval.")
             retrieval_results = self.retriever.retrieve_by_metadata(
                 where={"chunk_type": "title_reference"},
-                n_results=50 
+                n_results=1000 
             )
+            
+        elif mode == "SINGLE_PAPER" and target_paper_id:
+            print(f"Routing to SINGLE_PAPER retrieval (Paper ID: {target_paper_id}).")
+            # Deep dive: Retrieve more chunks, but scoped to this paper
+            # Merge with existing filter_by if present
+            scoped_filter = filter_by.copy() if filter_by else {}
+            scoped_filter["paper_id"] = target_paper_id
+            
+            retrieval_results = self.retriever.retrieve(
+                query=question,
+                n_results=15, # Fetch more context for single paper depth
+                filter_by=scoped_filter,
+                include_metadata=True,
+            )
+            
         else:
+            print(f"Routing to MULTI_PAPER retrieval (Standard).")
+            
+            # Dynamic Retrieval Adjustment based on Intent
+            query_lower = question.lower()
+            is_compare = any(k in query_lower for k in ["compare", "difference", " vs ", "versus", "comparison", "table"])
+            is_all_papers = any(k in query_lower for k in ["all papers", "every paper", "each paper", "uploaded papers", "summarize"])
+            is_diagram = any(k in query_lower for k in ["diagram", "figure", "image", "chart", "visual"])
+
+            # Increase recall for multi-paper tasks
+            adjusted_n = n_retrieve
+            if is_compare or is_all_papers:
+                adjusted_n = 30  # Boost to ensure we get chunks from multiple papers
+                print(f"Booster: Increasing retrieval to {adjusted_n} for multi-paper context.")
+            
+            if is_diagram:
+                adjusted_n = 25
+                print(f"Booster: Increasing retrieval to {adjusted_n} for diagram search.")
+                # We don't strictly filter by image_description because we also want text context about the images
+                # But the prompt content handling in response_generator.py will highlight images
+
             # Standard Semantic Search
             retrieval_results = self.retriever.retrieve(
                 query=question,
-                n_results=n_retrieve,
+                n_results=adjusted_n,
                 filter_by=filter_by,
                 include_metadata=True,
             )
@@ -105,10 +166,14 @@ class RAGPipeline:
             chatgpt_response = self.chatgpt.generate_from_retrieved_docs(
                 query=question,
                 retrieved_docs=retrieval_results["results"],
+                max_context_length=MAX_CONTEXT_LENGTH,
             )
 
             answer = chatgpt_response.get("response", "")
             response_success = chatgpt_response.get("success", False)
+            
+            if not response_success:
+                print(f"ChatGPT generation failed: {chatgpt_response.get('error')}")
         else:
             answer = self._create_simple_summary(
                 question, retrieval_results["results"]
