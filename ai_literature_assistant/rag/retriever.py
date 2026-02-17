@@ -1,92 +1,42 @@
-import os
-import sys
-import chromadb
 import numpy as np
 from typing import List, Dict, Optional
 from sentence_transformers import SentenceTransformer
 
-# Define project root relative to this file
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..")
-)
-
-# Ensure project root is in Python path
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+# 🔥 IMPORTANT: use shared Chroma client
+from ingestion.embed_store import get_shared_client, get_embedding_model
 
 
 class RAGRetriever:
     """Core RAG retriever for querying research papers from ChromaDB"""
 
-    # Initializes ChromaDB client, collection, and embedding model
     def __init__(
         self,
-        chroma_db_path: str = None,
         collection_name: str = "research_papers",
-        embedding_model: str = "all-MiniLM-L6-v2",
     ):
-        if chroma_db_path is None:
-            chroma_db_path = os.path.join(PROJECT_ROOT, "data", "chroma_db")
-
-        self.chroma_db_path = chroma_db_path
         self.collection_name = collection_name
-        self.embedding_model_name = embedding_model
 
-        self.client = None
-        self.collection = None
-        self.embedding_model = None
-
-        print(f"Looking for ChromaDB at: {self.chroma_db_path}")
-        self._initialize()
-
-    # Connects to ChromaDB and loads the embedding model
-    def _initialize(self):
         print("Initializing RAG Retriever...")
 
-        if not os.path.exists(self.chroma_db_path):
-            raise FileNotFoundError(
-                f"ChromaDB directory not found: {self.chroma_db_path}"
-            )
+        # ✅ Use shared Chroma client (singleton)
+        self.client = get_shared_client()
 
-        try:
-            self.client = chromadb.PersistentClient(
-                path=self.chroma_db_path
-            )
+        # ✅ Always get or create collection safely
+        self.collection = self.client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
 
-            collections = self.client.list_collections()
-            collection_names = [c.name for c in collections]
-            print(f"Available collections: {collection_names}")
+        # ✅ Use shared embedding model (no reload)
+        self.embedding_model = get_embedding_model()
 
-            if self.collection_name not in collection_names:
-                raise ValueError(
-                    f"Collection '{self.collection_name}' not found. "
-                    f"Available: {collection_names}"
-                )
+        print("RAG Retriever initialized successfully")
+        print(f"Collection: {self.collection_name}")
+        print(f"Documents: {self.collection.count()}")
 
-            self.collection = self.client.get_collection(
-                name=self.collection_name
-            )
+    # ─────────────────────────────────────────────────────────────
+    # Retrieval
+    # ─────────────────────────────────────────────────────────────
 
-            print(f"Loading embedding model: {self.embedding_model_name}")
-            self.embedding_model = SentenceTransformer(
-                self.embedding_model_name
-            )
-
-            embedding_dim = (
-                self.embedding_model.get_sentence_embedding_dimension()
-            )
-
-            print("RAG Retriever initialized successfully")
-            print(f"Database: {self.chroma_db_path}")
-            print(f"Collection: {self.collection_name}")
-            print(f"Documents: {self.collection.count()}")
-            print(f"Embedding dimension: {embedding_dim}")
-
-        except Exception as e:
-            print(f"Initialization failed: {e}")
-            raise
-
-    # Retrieves top-k relevant documents for a given query
     def retrieve(
         self,
         query: str,
@@ -95,13 +45,11 @@ class RAGRetriever:
         include_metadata: bool = True,
     ) -> Dict:
         try:
-            query_embedding = self.embedding_model.encode(
-                [query]
-            ).tolist()
+            query_embedding = self.embedding_model.encode([query]).tolist()
 
             query_kwargs = {
                 "query_embeddings": query_embedding,
-                "n_results": min(n_results, self.collection.count()),
+                "n_results": min(n_results, max(self.collection.count(), 1)),
             }
 
             if filter_by:
@@ -124,47 +72,48 @@ class RAGRetriever:
                 "success": False,
             }
 
+    # ─────────────────────────────────────────────────────────────
+
     def retrieve_by_metadata(
         self,
         where: Dict,
         n_results: int = 100,
     ) -> Dict:
-        """Directly retrieve documents matching metadata filters (no vector search)."""
         try:
-            # collection.get returns flat lists, not list of lists like query()
             results = self.collection.get(
                 where=where,
                 limit=n_results,
-                include=["documents", "metadatas"]
+                include=["documents", "metadatas"],
             )
-            
+
             formatted = []
             if results["ids"]:
                 for i in range(len(results["ids"])):
-                    item = {
+                    formatted.append({
                         "id": results["ids"][i],
-                        "content": results["documents"][i] if results.get("documents") else "",
-                        "metadata": results["metadatas"][i] if results.get("metadatas") else {},
-                        "similarity_score": 1.0,  # Exact match implied
-                        "distance": 0.0
-                    }
-                    formatted.append(item)
-            
+                        "content": results["documents"][i],
+                        "metadata": results["metadatas"][i],
+                        "similarity_score": 1.0,
+                        "distance": 0.0,
+                    })
+
             return {
                 "query": f"metadata_filter={where}",
                 "results": formatted,
                 "total": len(formatted),
-                "success": True
+                "success": True,
             }
+
         except Exception as e:
             return {
                 "error": str(e),
                 "results": [],
                 "total": 0,
-                "success": False
+                "success": False,
             }
 
-    # Formats raw ChromaDB results into a structured response
+    # ─────────────────────────────────────────────────────────────
+
     def _format_results(self, query: str, raw_results: Dict) -> Dict:
         if not raw_results or not raw_results.get("ids"):
             return {
@@ -181,8 +130,7 @@ class RAGRetriever:
                 "id": raw_results["ids"][0][i],
                 "content": raw_results["documents"][0][i],
                 "distance": raw_results["distances"][0][i],
-                "similarity_score": 1
-                - raw_results["distances"][0][i],
+                "similarity_score": 1 - raw_results["distances"][0][i],
             }
 
             if raw_results.get("metadatas"):
@@ -196,48 +144,14 @@ class RAGRetriever:
             "query": query,
             "results": formatted,
             "total": len(formatted),
-            "average_similarity": float(np.mean(scores))
-            if scores
-            else 0,
+            "average_similarity": float(np.mean(scores)) if scores else 0,
             "min_similarity": float(min(scores)) if scores else 0,
             "max_similarity": float(max(scores)) if scores else 0,
             "success": True,
         }
 
-    # Builds a concatenated context string from retrieved documents
-    def get_context_for_query(
-        self,
-        query: str,
-        n_results: int = 5,
-        max_context_length: int = 4000,
-    ) -> str:
-        results = self.retrieve(query, n_results)
+    # ─────────────────────────────────────────────────────────────
 
-        if not results["results"]:
-            return "No relevant documents found."
-
-        context = []
-        total_len = 0
-
-        for i, r in enumerate(results["results"], 1):
-            meta = r.get("metadata", {})
-            source = " | ".join(
-                f"{k}: {v}"
-                for k, v in meta.items()
-                if v not in ("unknown", None)
-            )
-
-            block = f"[Document {i} | {source}]\n{r['content']}"
-
-            if total_len + len(block) > max_context_length:
-                break
-
-            context.append(block)
-            total_len += len(block)
-
-        return "\n\n---\n\n".join(context)
-
-    # Returns statistics about the ChromaDB collection
     def get_collection_stats(self) -> Dict:
         total_docs = self.collection.count()
         sample_size = min(100, total_docs)

@@ -9,23 +9,32 @@ import os
 from datetime import datetime
 import uuid
 import logging
+import shutil
 
-# Third-party imports
 import chromadb
-from sqlalchemy.orm import Session as DBSession
+chromadb.api.client.SharedSystemClient.clear_system_cache()
 
-# Ingestion: ONE import, ONE function call — app.py never touches
-# pdf_loader / preprocess / embed_store / image_extractor directly.
+# Research metadata DB
+from db.database import SessionLocal as ResearchSessionLocal, init_db as init_research_db
+from db.models import ResearchPaperMetadata
+
+# Chat/auth DB
+from database import Session as ChatSession, Message, SessionLocal as ChatSessionLocal, init_db as init_chat_db
+
+from ingestion.embed_store import get_shared_client
 from ingestion.ingest_all import ingest_uploaded_files, IngestResult, CHROMA_DIR
-
-# App-level concerns only
+from utils.ai_comparison_engine import generate_comparison_insight
 from rag.pipeline import RAGPipeline
 from auth import auth_dialog, logout
-from database import Session as ChatSession, Message, SessionLocal, init_db
+
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # ==================== CONFIGURATION ====================
 st.set_page_config(
@@ -45,7 +54,9 @@ def load_css():
         pass
 
 # Initialize database
-init_db()
+init_research_db()
+init_chat_db()
+
 
 # Load custom CSS immediately after set_page_config
 load_css()
@@ -56,7 +67,7 @@ from utils.document_selector import DocumentSelector
 from utils.metrics_tracker import MetricsTracker, ConfidenceCalculator
 from utils.ui_components import SearchModeSelector
 from utils.export_tools import ChatExporter
-from utils.comparison_tools import DocumentComparator
+# from utils.comparison_tools import DocumentComparator
 from utils.auth_helper import init_session_auth, cleanup_expired_sessions
 
 # ==================== CRITICAL: INITIALIZE AUTH FIRST ====================
@@ -101,31 +112,31 @@ if 'current_tab' not in st.session_state:
 if 'sidebar_expanded' not in st.session_state:
     st.session_state.sidebar_expanded = False
 
+if 'documents_ready' not in st.session_state:
+    st.session_state.documents_ready = False
+
 
 # ==================== HELPER FUNCTIONS ====================
-
 @st.cache_resource(show_spinner=False)
 def get_rag_pipeline():
-    """Retrieve or create the RAG pipeline."""
     try:
-        client = chromadb.PersistentClient(path=CHROMA_DIR)
-        try:
-            collection = client.get_collection("research_papers")
-            if collection.count() == 0:
+        if st.session_state.documents_ready:
+            client = get_shared_client()
+            try:
+                collection = client.get_collection("research_papers")
+                if collection.count() > 0:
+                    return RAGPipeline()
+            except ValueError:
                 return None
-        except ValueError:
-            return None  # Collection doesn't exist
-        
-        pipeline = RAGPipeline()
-        # pipeline.initialize() # Removed as it doesn't exist on the class
-        return pipeline
     except Exception as e:
         logger.error(f"Error initializing pipeline: {e}")
         return None
 
+
 def load_chat_session(session_id):
     """Load conversation history from database"""
-    db = SessionLocal()
+    db = ChatSessionLocal()
+
     try:
         session = db.query(ChatSession).get(session_id)
         if session:
@@ -157,7 +168,8 @@ def load_chat_session(session_id):
 
 def enforce_max_sessions(user_id, max_sessions=20):
     """Enforce max N chat sessions per user, deleting oldest beyond the limit."""
-    db = SessionLocal()
+    db = ChatSessionLocal()
+
     try:
         all_sessions = db.query(ChatSession).filter(
             ChatSession.user_id == user_id
@@ -174,17 +186,80 @@ def enforce_max_sessions(user_id, max_sessions=20):
     finally:
         db.close()
 
+def generate_conversation_title(first_message):
+    """Generate a meaningful title from the first message"""
+    import re
+    
+    # Common question words to remove from beginning
+    question_starters = [
+        'what is', 'what are', 'what does', 'what can', 'what would',
+        'how does', 'how can', 'how would', 'how is', 'how are',
+        'why is', 'why are', 'why does', 'why do',
+        'when does', 'when can', 'when will',
+        'where is', 'where are', 'where can',
+        'who is', 'who are', 'who can',
+        'which is', 'which are', 'which can',
+        'can you', 'could you', 'would you', 'should you',
+        'is there', 'are there', 'do we', 'does it'
+    ]
+    
+    content = first_message.lower().strip()
+    
+    # Remove question starters
+    for starter in question_starters:
+        if content.startswith(starter):
+            content = content[len(starter):].strip()
+            break
+    
+    # Remove question marks and other punctuation at the end
+    content = re.sub(r'[?!.]+$', '', content)
+    
+    # Get first meaningful phrase (up to 40 chars)
+    if len(content) > 40:
+        # Try to break at word boundary
+        for i in range(40, 30, -1):
+            if content[i] == ' ':
+                content = content[:i]
+                break
+        else:
+            content = content[:40]
+    
+    # Capitalize properly
+    words = content.split()
+    if words:
+        # Capitalize first word
+        words[0] = words[0].capitalize()
+        # Keep proper nouns (words that start with capital in original)
+        original_words = first_message.split()
+        for i, word in enumerate(words):
+            if i < len(original_words) and original_words[i][0].isupper():
+                words[i] = word.capitalize()
+        content = ' '.join(words)
+    
+    # Add ellipsis if truncated
+    if len(first_message.strip()) > len(content):
+        content += "..."
+    
+    # Fallback if title is too short after cleaning
+    if len(content.strip()) < 5:
+        content = first_message[:30] + "..." if len(first_message) > 30 else first_message
+    
+    return content[:50].strip()  # Ensure max 50 characters
+
+
 def save_message(role, content, sources=None):
     """Save message to database, creating session if needed"""
     if not st.session_state.authenticated:
         return
     
-    db = SessionLocal()
+    db = ChatSessionLocal()
+
     
     try:
         current_sid = st.session_state.get('current_session_id')
         if not current_sid:
-            title = content[:30] + "..." if len(content) > 30 else content
+            # Generate a meaningful title from the first message
+            title = generate_conversation_title(content)
             new_sess = ChatSession(
                 user_id=st.session_state.user_id,
                 title=title
@@ -418,16 +493,6 @@ with st.sidebar:
                 except Exception as e:
                     logger.error(f"Failed to clear extracted images: {e}")
                 
-                # Clear ChromaDB to keep it fresh for the new session
-                try:
-                    import shutil
-                    st.cache_resource.clear()
-                    if os.path.exists(CHROMA_DIR):
-                        shutil.rmtree(CHROMA_DIR)
-                        os.makedirs(CHROMA_DIR, exist_ok=True)
-                except Exception as e:
-                    logger.error(f"Failed to clear ChromaDB: {e}")
-                
                 st.session_state.current_tab = "chat"
                 st.rerun()
             
@@ -438,7 +503,7 @@ with st.sidebar:
             is_toggling = st.session_state.pop('_sidebar_toggling', False)
             
             try:
-                db = SessionLocal()
+                db = ChatSessionLocal()
                 user_sessions = db.query(ChatSession).filter(
                     ChatSession.user_id == st.session_state.user_id
                 ).order_by(ChatSession.last_updated.desc()).limit(20).all()
@@ -459,6 +524,29 @@ with st.sidebar:
                 db.close()
             except Exception as e:
                 logger.error(f"Failed to load history: {e}")
+            
+            # Reset Knowledge Base button at the end of expanded sidebar
+            if st.button("Reset Knowledge Base", key="nav-reset", help="Clear all papers & embeddings", use_container_width=True):
+                
+                # 1) Clear chat
+                st.session_state.conversation = []
+                st.session_state.current_session_id = None
+
+                # 2) Reset document manager
+                st.session_state.doc_manager = DocumentManager()
+                st.session_state.documents_ready = False
+
+                # 3) Clear Chroma embeddings
+                try:
+                    st.cache_resource.clear()
+                    if os.path.exists(CHROMA_DIR):
+                        shutil.rmtree(CHROMA_DIR)
+                        os.makedirs(CHROMA_DIR, exist_ok=True)
+                except Exception as e:
+                    logger.error(f"Failed to clear ChromaDB: {e}")
+                
+                st.session_state.current_tab = "chat"
+                st.rerun()
 
     else:
         if st.button(".", key="nav-chat-icon", help="Chat"):
@@ -508,12 +596,23 @@ with st.sidebar:
                         shutil.rmtree(CHROMA_DIR)
                         os.makedirs(CHROMA_DIR, exist_ok=True)
                 except Exception as e:
-                    logger.error(f"Failed to clear ChromaDB: {e}")
-                
-                st.session_state.current_tab = "chat"
+                    logger.error(f"Failed clearing Chroma: {e}")
+
+                # 4) Clear research metadata DB
+                try:
+                    db = ResearchSessionLocal()
+                    db.query(ResearchPaperMetadata).delete()
+                    db.commit()
+                    db.close()
+                except Exception as e:
+                    logger.error(f"Failed clearing metadata DB: {e}")
+
+                st.success("Workspace cleared. Upload new research papers.")
                 st.rerun()
 
-# ==================== MAIN HEADER ====================
+
+
+# ==================== MAIN CONTENT AREA ====================
 st.markdown("""
     <div class="main-header-container">
         <h1>AI Research Literature Assistant</h1>
@@ -539,7 +638,14 @@ if st.session_state.current_tab == "chat":
     # However, we won't visually populate the "Document Library" tab without metadata logic,
     # but the chat will work.
     is_history = st.session_state.get('is_history_view', False)
-    has_documents = st.session_state.doc_manager.get_document_count() > 0 or (pipeline_status is not None) or is_history
+    # has_documents = st.session_state.doc_manager.get_document_count() > 0 or (pipeline_status is not None) or is_history
+
+    has_documents = (
+        st.session_state.documents_ready
+        or st.session_state.doc_manager.get_document_count() > 0
+        or (pipeline_status is not None)
+        or is_history
+    )
 
     if not st.session_state.authenticated:
         _, col_center, _ = st.columns([1, 2, 1])
@@ -616,10 +722,17 @@ if st.session_state.current_tab == "chat":
 
                     # ── Hand off to ingestion layer — app.py stops here ──
                     success = _process_and_ingest(cached)
+                    # if success:
+                    #     st.session_state.pop('_uploaded_file_data', None)
+                    #     st.session_state.pop('_uploaded_file_objects', None)
+                    #     st.success("Documents processed successfully!")
+                    #     get_rag_pipeline.clear()
+                    #     st.rerun()
                     if success:
+                        st.session_state.documents_ready = True
                         st.session_state.pop('_uploaded_file_data', None)
                         st.session_state.pop('_uploaded_file_objects', None)
-                        st.success("Documents processed successfully!")
+                        st.success("Documents processed successfully! You can now chat with your papers.")
                         get_rag_pipeline.clear()
                         st.rerun()
                     else:
@@ -716,25 +829,97 @@ elif st.session_state.current_tab == "documents":
     else:
         st.info("No documents uploaded yet. Go to Chat tab to upload PDFs.")
 
+
 # ==================== COMPARE TAB ====================
 elif st.session_state.current_tab == "compare":
     st.subheader("Compare Research Papers")
 
-    if st.session_state.doc_manager.get_document_count() > 1:
-        doc_names = st.session_state.doc_manager.get_document_names()
-        
-        selected_docs = st.multiselect("Select papers to compare:", doc_names)
-        question = st.text_input("What would you like to compare?")
-        
-        if st.button("Compare", type="primary"):
-            if len(selected_docs) < 2:
-                st.warning("Please select at least 2 documents")
-            elif not question:
-                st.warning("Please enter a comparison question")
-            else:
-                st.info("Comparison engine will analyze the selected papers...")
-    else:
-        st.info("Upload at least 2 documents to use the comparison feature")
+    from db.models import ResearchPaperMetadata
+
+    db = ResearchSessionLocal()
+
+
+    try:
+        papers = db.query(ResearchPaperMetadata)\
+            .filter(ResearchPaperMetadata.title.isnot(None))\
+            .all()
+
+        if len(papers) < 2:
+            st.info("Upload at least 2 research papers to enable comparison.")
+        else:
+            paper_titles = [p.title for p in papers if p.title]
+
+            selected_titles = st.multiselect(
+                "Select papers to compare:",
+                paper_titles
+            )
+
+            selected_papers = []
+
+            if selected_titles:
+                selected_papers = (
+                    db.query(ResearchPaperMetadata)
+                    .filter(ResearchPaperMetadata.title.in_(selected_titles))
+                    .all()
+                )
+
+                # Build comparison table
+                comparison_data = []
+
+                for p in selected_papers:
+                    comparison_data.append({
+                        "Title": p.title,
+                        "Year": p.year,
+                        "Domain": p.domain,
+                        "Research Problem": p.research_problem,
+                        "Methodology": p.methodology,
+                        "Dataset": p.dataset,
+                        "Evaluation Metrics": p.evaluation_metrics,
+                        "Baseline Models": p.baseline_models,
+                        "Key Results": p.key_results,
+                        "Contributions": p.contributions,
+                        "Limitations": p.limitations,
+                        "Future Work": p.future_work,
+                    })
+
+                import pandas as pd
+                df = pd.DataFrame(comparison_data)
+
+                st.markdown("### Comparison Table")
+                st.dataframe(df, use_container_width=True)
+
+                # AI insight button OUTSIDE finally
+                if len(selected_papers) >= 2:
+                    if st.button("Generate AI Comparison Insight", type="primary", key="ai_comparison_btn"):
+                        with st.spinner("Analyzing research papers..."):
+
+                            papers_json = [
+                                {
+                                    "title": p.title,
+                                    "year": p.year,
+                                    "domain": p.domain,
+                                    "research_problem": p.research_problem,
+                                    "methodology": p.methodology,
+                                    "dataset": p.dataset,
+                                    "evaluation_metrics": p.evaluation_metrics,
+                                    "baseline_models": p.baseline_models,
+                                    "key_results": p.key_results,
+                                    "contributions": p.contributions,
+                                    "limitations": p.limitations,
+                                    "future_work": p.future_work,
+                                }
+                                for p in selected_papers
+                            ]
+
+                            insight = generate_comparison_insight(papers_json)
+
+                            st.markdown("AI Research Analysis")
+                            st.markdown(insight)
+
+    finally:
+        db.close()
+
+
 
 # ==================== EXPORT TAB ====================
 elif st.session_state.current_tab == "export":
